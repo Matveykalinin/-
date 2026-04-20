@@ -1,0 +1,304 @@
+"""
+Метод Холецкого с поддержкой облачных вычислений
+Адаптировано для запуска на GitHub Actions и локально
+"""
+
+import numpy as np
+import time
+import math
+import os
+import json
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+import multiprocessing as mp
+from typing import Tuple, Dict, List
+import tempfile
+
+# Попытка импорта Google Cloud Storage (опционально)
+try:
+    from google.cloud import storage
+    CLOUD_AVAILABLE = True
+except ImportError:
+    CLOUD_AVAILABLE = False
+    print("Google Cloud Storage не установлен. Работа без облачного хранилища.")
+
+# Для GitHub Actions определяем переменные окружения
+GITHUB_ACTIONS = os.getenv('GITHUB_ACTIONS') == 'true'
+
+
+class CholeskyCloudGitHub:
+    """Метод Холецкого, адаптированный для CI/CD и GitHub Actions"""
+    
+    def __init__(self, matrix_size: int = 500, block_size: int = 100):
+        self.n = matrix_size
+        self.block_size = min(block_size, matrix_size)
+        self.num_blocks = math.ceil(matrix_size / self.block_size)
+        self.use_cloud = CLOUD_AVAILABLE and not GITHUB_ACTIONS
+        
+    def generate_spd_matrix(self, cond_number: float = 100.0) -> np.ndarray:
+        """
+        Генерация симметричной положительно определённой матрицы
+        с контролируемым числом обусловленности
+        """
+        # Генерируем случайную матрицу
+        A = np.random.rand(self.n, self.n)
+        A = A @ A.T
+        
+        # Добавляем диагональное преобладание для гарантии SPD
+        A += np.eye(self.n) * (np.linalg.norm(A, 'fro') / self.n)
+        
+        # Масштабируем для получения желаемого числа обусловленности
+        if cond_number > 1:
+            eigenvalues = np.linalg.eigvalsh(A)
+            min_eig = np.min(eigenvalues)
+            max_eig = np.max(eigenvalues)
+            scale = (max_eig / min_eig) / cond_number
+            A += np.eye(self.n) * (min_eig * scale - min_eig)
+        
+        return A
+    
+    def cholesky_serial(self, A: np.ndarray) -> np.ndarray:
+        """
+        Классический последовательный метод Холецкого
+        Сложность: O(n³/3)
+        """
+        n = A.shape[0]
+        L = np.zeros_like(A)
+        
+        for i in range(n):
+            # Диагональный элемент
+            sum_sq = sum(L[i, k] ** 2 for k in range(i))
+            L[i, i] = math.sqrt(max(A[i, i] - sum_sq, 1e-12))
+            
+            # Поддиагональные элементы
+            for j in range(i + 1, n):
+                sum_prod = sum(L[j, k] * L[i, k] for k in range(i))
+                L[j, i] = (A[j, i] - sum_prod) / L[i, i]
+        
+        return L
+    
+    def cholesky_block_parallel(self, A: np.ndarray, num_workers: int = None) -> np.ndarray:
+        """
+        Блочно-параллельный метод Холецкого для распределённых вычислений
+        """
+        if num_workers is None:
+            num_workers = max(1, mp.cpu_count() - 1 if GITHUB_ACTIONS else mp.cpu_count())
+        
+        n = A.shape[0]
+        bs = self.block_size
+        nb = self.num_blocks
+        L = np.zeros_like(A)
+        
+        # Копируем матрицу для модификации
+        A_work = A.copy()
+        
+        for k in range(nb):
+            k_start = k * bs
+            k_end = min((k + 1) * bs, n)
+            
+            # Шаг 1: Разложение диагонального блока (последовательно)
+            A_kk = A_work[k_start:k_end, k_start:k_end]
+            L_kk = self.cholesky_serial(A_kk)
+            L[k_start:k_end, k_start:k_end] = L_kk
+            
+            # Шаг 2: Параллельное решение для поддиагональных блоков
+            if k < nb - 1:
+                tasks = []
+                for i in range(k + 1, nb):
+                    i_start = i * bs
+                    i_end = min((i + 1) * bs, n)
+                    tasks.append((i_start, i_end, k_start, k_end, A_work, L_kk))
+                
+                # Используем пул процессов для параллельной обработки
+                with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                    futures = [executor.submit(self._solve_block, *task) for task in tasks]
+                    for future, (i_start, i_end, _, _, _, _) in zip(futures, tasks):
+                        L_block = future.result()
+                        L[i_start:i_end, k_start:k_end] = L_block
+            
+            # Шаг 3: Обновление оставшейся подматрицы
+            for i in range(k + 1, nb):
+                i_start = i * bs
+                i_end = min((i + 1) * bs, n)
+                L_ik = L[i_start:i_end, k_start:k_end]
+                
+                for j in range(i, nb):
+                    j_start = j * bs
+                    j_end = min((j + 1) * bs, n)
+                    L_jk = L[j_start:j_end, k_start:k_end]
+                    
+                    A_work[i_start:i_end, j_start:j_end] -= L_ik @ L_jk.T
+                    
+                    if i != j:
+                        A_work[j_start:j_end, i_start:i_end] = A_work[i_start:i_end, j_start:j_end].T
+        
+        return L
+    
+    @staticmethod
+    def _solve_block(i_start: int, i_end: int, k_start: int, k_end: int, 
+                     A: np.ndarray, L_kk: np.ndarray) -> np.ndarray:
+        """Решение для одного блока (может выполняться на отдельном ядре)"""
+        A_ik = A[i_start:i_end, k_start:k_end]
+        # L_ik = A_ik * inv(L_kk^T)
+        try:
+            L_ik = A_ik @ np.linalg.inv(L_kk.T)
+        except np.linalg.LinAlgError:
+            # Если матрица вырождена, используем псевдообратную
+            L_ik = A_ik @ np.linalg.pinv(L_kk.T)
+        return L_ik
+    
+    def verify_decomposition(self, A: np.ndarray, L: np.ndarray) -> Dict[str, float]:
+        """Верификация разложения с различными метриками"""
+        reconstruction = L @ L.T
+        abs_error = np.linalg.norm(A - reconstruction, 'fro')
+        rel_error = abs_error / np.linalg.norm(A, 'fro')
+        
+        # Проверка треугольности
+        is_lower_triangular = np.allclose(L, np.tril(L))
+        
+        # Проверка положительности диагонали
+        diag_positive = np.all(np.diag(L) > 0)
+        
+        return {
+            'absolute_error': float(abs_error),
+            'relative_error': float(rel_error),
+            'is_lower_triangular': is_lower_triangular,
+            'diag_positive': diag_positive
+        }
+    
+    def benchmark(self, sizes: List[int] = None) -> List[Dict]:
+        """Бенчмаркинг производительности"""
+        if sizes is None:
+            sizes = [100, 200, 400]
+        
+        results = []
+        
+        for size in sizes:
+            if size > 1000 and GITHUB_ACTIONS:
+                print(f"Пропускаем размер {size} (ограничение GitHub Actions)")
+                continue
+                
+            print(f"\nТестирование матрицы {size}×{size}")
+            
+            # Генерация тестовой матрицы
+            A = self.generate_spd_matrix()
+            
+            # Последовательная версия
+            start = time.time()
+            L_serial = self.cholesky_serial(A.copy())
+            time_serial = time.time() - start
+            verif_serial = self.verify_decomposition(A, L_serial)
+            
+            # Параллельная версия
+            start = time.time()
+            L_parallel = self.cholesky_block_parallel(A.copy())
+            time_parallel = time.time() - start
+            verif_parallel = self.verify_decomposition(A, L_parallel)
+            
+            results.append({
+                'size': size,
+                'time_serial': round(time_serial, 4),
+                'time_parallel': round(time_parallel, 4),
+                'speedup': round(time_serial / time_parallel, 2),
+                'error_serial': verif_serial['relative_error'],
+                'error_parallel': verif_parallel['relative_error']
+            })
+            
+            print(f"    Serial: {time_serial:.4f}s")
+            print(f"    Parallel: {time_parallel:.4f}s")
+            print(f"    Speedup: {time_serial/time_parallel:.2f}x")
+            print(f"    Error: {verif_parallel['relative_error']:.2e}")
+        
+        return results
+    
+    def save_results_to_json(self, results: List[Dict], filename: str = 'benchmark_results.json'):
+        """Сохранение результатов в JSON для CI/CD"""
+        output = {
+            'timestamp': time.time(),
+            'matrix_sizes': [r['size'] for r in results],
+            'serial_times': [r['time_serial'] for r in results],
+            'parallel_times': [r['time_parallel'] for r in results],
+            'speedups': [r['speedup'] for r in results],
+            'errors': [r['error_parallel'] for r in results]
+        }
+        
+        with open(filename, 'w') as f:
+            json.dump(output, f, indent=2)
+        
+        print(f"\n💾 Результаты сохранены в {filename}")
+        return filename
+
+
+def run_tests():
+    """Запуск всех тестов для GitHub Actions"""
+    print("=" * 70)
+    print("Запуск тестов метода Холецкого в среде GitHub Actions")
+    print("=" * 70)
+    
+    # Тест 1: Маленькая матрица (быстрый тест)
+    print("\n Тест 1: Корректность алгоритма (матрица 50×50)")
+    solver = CholeskyCloudGitHub(matrix_size=50, block_size=25)
+    A = solver.generate_spd_matrix()
+    L = solver.cholesky_serial(A)
+    verification = solver.verify_decomposition(A, L)
+    
+    assert verification['relative_error'] < 1e-10, "Ошибка разложения слишком велика"
+    assert verification['is_lower_triangular'], "Матрица L не является нижнетреугольной"
+    assert verification['diag_positive'], "Диагональные элементы не положительны"
+    print("Тест 1 пройден")
+    
+    # Тест 2: Сравнение последовательной и параллельной версий
+    print("\n Тест 2: Сравнение версий (матрица 100×100)")
+    solver = CholeskyCloudGitHub(matrix_size=100, block_size=50)
+    A = solver.generate_spd_matrix()
+    
+    L_serial = solver.cholesky_serial(A.copy())
+    L_parallel = solver.cholesky_block_parallel(A.copy())
+    
+    diff = np.linalg.norm(L_serial - L_parallel)
+    assert diff < 1e-8, f"Результаты различаются: {diff}"
+    print("Тест 2 пройден")
+    
+    # Тест 3: Бенчмаркинг
+    print("\n Тест 3: Бенчмаркинг производительности")
+    results = solver.benchmark(sizes=[100, 200])
+    solver.save_results_to_json(results)
+    
+    # Проверка ускорения
+    for r in results:
+        if r['size'] >= 200:
+            assert r['speedup'] > 1.0, f"Нет ускорения для размера {r['size']}"
+    
+    print("Тест 3 пройден")
+    
+    print("\n" + "=" * 70)
+    print("Все тесты успешно завершены!")
+    print("=" * 70)
+    
+    return results
+
+
+if __name__ == "__main__":
+    # Определяем режим запуска
+    if GITHUB_ACTIONS:
+        # В GitHub Actions запускаем только тесты
+        run_tests()
+    else:
+        # Локальный запуск с полной демонстрацией
+        print("Локальный запуск с полной демонстрацией")
+        solver = CholeskyCloudGitHub(matrix_size=400, block_size=100)
+        A = solver.generate_spd_matrix()
+        
+        print("\nПоследовательное разложение...")
+        start = time.time()
+        L_serial = solver.cholesky_serial(A.copy())
+        time_serial = time.time() - start
+        
+        print("Параллельное разложение...")
+        start = time.time()
+        L_parallel = solver.cholesky_block_parallel(A.copy())
+        time_parallel = time.time() - start
+        
+        print(f"\nРезультаты:")
+        print(f"  Serial:   {time_serial:.4f}s")
+        print(f"  Parallel: {time_parallel:.4f}s")
+        print(f"  Speedup:  {time_serial/time_parallel:.2f}x")
